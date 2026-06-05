@@ -41,8 +41,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-IMG_DIR      = "./fickr8k/Images"
-CAPTIONS_CSV = "./fickr8k/captions.txt"
+IMG_DIR      = "./flickr8k/Images"
+CAPTIONS_CSV = "./flickr8k/captions.txt"
 LATENT_CACHE = "latents_cache.pt"    # pre-computed VAE latents (created once)
 
 # swap "openai/clip-vit-large-patch14" for richer 768-dim embeddings
