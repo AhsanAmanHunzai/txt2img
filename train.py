@@ -532,46 +532,25 @@ class LiveViz:
 # ── CLI progress (--no_gui mode) ───────────────────────────────────────────────
 
 class CLIProgress:
-    """Rich terminal dashboard used when --no_gui is passed."""
+    """
+    CLI training display for --no_gui mode.
+    Uses a single overwriting status line (\r) — no Live panels, no stacking.
+    Sample generation is skipped entirely (controlled in the training loop).
+    """
+    _WIDTH = 110   # chars to clear on each \r
 
     def __init__(self):
         from rich.console import Console
-        from rich.live import Live
-        self.console = Console()
-        self._s = dict(epoch=0, total=EPOCHS, step=0,
-                       loss=0.0, ema=0.0, lr=LR, best=float("inf"))
+        self.console    = Console(highlight=False)
+        self._s         = dict(epoch=0, total=EPOCHS, step=0,
+                               loss=0.0, ema=0.0, lr=LR, best=float("inf"))
         self.ema_vals   = []
         self._ema_alpha = 0.02
-        self._live = Live(self._render(), refresh_per_second=4,
-                          console=self.console, transient=False)
-        self._live.__enter__()
-
-    def _render(self):
-        from rich.table import Table
-        from rich.panel import Panel
-        s = self._s
-        t = Table(show_header=True, header_style="bold cyan",
-                  expand=True, border_style="bright_black")
-        for col, just in [("Epoch","center"),("Step","right"),
-                          ("Loss","right"),("EMA Loss","right"),
-                          ("LR","right"),("Best Loss","right")]:
-            t.add_column(col, justify=just)
-        new_best = s["loss"] <= s["best"] + 1e-9
-        t.add_row(
-            f"[cyan]{s['epoch']}/{s['total']}[/]",
-            f"[white]{s['step']:,}[/]",
-            f"[yellow]{s['loss']:.5f}[/]",
-            f"[bright_green]{s['ema']:.5f}[/]",
-            f"[blue]{s['lr']:.2e}[/]",
-            f"[bright_green]{s['best']:.5f}[/]" if new_best
-            else f"[white]{s['best']:.5f}[/]",
-        )
-        return Panel(
-            t,
-            title=(f"[bold magenta]Flux2-Flickr[/]  "
-                   f"[dim]{BACKBONE.upper()} · CLIP · VAE · Rectified Flow[/]"),
-            subtitle=f"[dim]{DEVICE.upper()} · CFG ×{CFG_SCALE}[/]",
-            border_style="bright_black",
+        self.console.print(
+            f"[bold magenta]Flux2-Flickr[/]  "
+            f"[dim]{BACKBONE.upper()} · CLIP · VAE · Rectified Flow · "
+            f"{DEVICE.upper()} · CFG ×{CFG_SCALE}[/]\n"
+            "─" * self._WIDTH
         )
 
     def update_loss(self, step, loss):
@@ -585,13 +564,7 @@ class CLIProgress:
             self._s["best"] = loss
 
     def update_samples(self, images, captions):
-        # Briefly stop the live panel, print a log line, resume
-        self._live.stop()
-        self.console.log(
-            f"[cyan]step {self._s['step']}[/] → samples: "
-            + "  ".join(f'[dim italic]"{c[:40]}"[/]' for c in captions)
-        )
-        self._live.start()
+        pass   # sample generation is disabled in --no_gui mode
 
     def set_info(self, epoch, total_epochs, lr):
         self._s["epoch"] = epoch
@@ -599,11 +572,26 @@ class CLIProgress:
         self._s["lr"]    = lr
 
     def flush(self):
-        self._live.update(self._render())
+        s = self._s
+        line = (f"\r  epoch {s['epoch']:>3}/{s['total']}"
+                f"  step {s['step']:>8,}"
+                f"  loss {s['loss']:.5f}"
+                f"  ema {s['ema']:.5f}"
+                f"  lr {s['lr']:.2e}"
+                f"  best {s['best']:.5f}   ")
+        _sys.stdout.write(line.ljust(self._WIDTH))
+        _sys.stdout.flush()
+
+    def log(self, msg):
+        """Print a permanent line (epoch end, checkpoint) without breaking the status line."""
+        _sys.stdout.write("\r" + " " * self._WIDTH + "\r")
+        _sys.stdout.flush()
+        self.console.print(msg)
 
     def close(self):
-        self._live.__exit__(None, None, None)
-        self.console.print("[bold green]✓ Training complete.[/]")
+        _sys.stdout.write("\n")
+        self.console.print("─" * self._WIDTH)
+        self.console.print("[bold green]✓  Training complete.[/]")
 
 
 # ── Training ──────────────────────────────────────────────────────────────────
@@ -701,7 +689,8 @@ def train(no_gui=False):
             viz.update_loss(step, loss.item())
             viz.set_info(epoch, EPOCHS, lr_sched.get_last_lr()[0])
 
-            if step % VIZ_EVERY == 0:
+            # sample generation only in GUI mode (expensive, nothing to show otherwise)
+            if step % VIZ_EVERY == 0 and not no_gui:
                 ema_model.eval()
                 with torch.no_grad():
                     ctx_viz  = clip.encode(fixed_prompts, DEVICE)
@@ -717,7 +706,11 @@ def train(no_gui=False):
             viz.flush()
 
         avg = epoch_loss / len(loader)
-        print(f"Epoch {epoch:>3}/{EPOCHS} | loss {avg:.5f} | lr {lr_sched.get_last_lr()[0]:.2e}")
+        epoch_msg = f"Epoch {epoch:>3}/{EPOCHS} | loss {avg:.5f} | lr {lr_sched.get_last_lr()[0]:.2e}"
+        if no_gui:
+            viz.log(epoch_msg)
+        else:
+            print(epoch_msg)
 
         if epoch % SAVE_EVERY == 0 or avg < best_loss:
             best_loss = min(best_loss, avg)
@@ -727,7 +720,11 @@ def train(no_gui=False):
                         "ema_model": ema_model.state_dict(),
                         "optimizer": optimizer.state_dict(),
                         "loss": avg}, p)
-            print(f"  → {p}")
+            ckpt_msg = f"  → saved {p}"
+            if no_gui:
+                viz.log(ckpt_msg)
+            else:
+                print(ckpt_msg)
 
     viz.close()
 
