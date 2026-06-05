@@ -28,8 +28,11 @@ from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL
 
+import sys as _sys
 import matplotlib
-matplotlib.use("TkAgg")
+# Set backend before any other matplotlib import.
+# In --no_gui mode use non-interactive Agg so no display is needed.
+matplotlib.use("Agg" if "--no_gui" in _sys.argv else "TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
@@ -38,8 +41,8 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-IMG_DIR      = "Images"
-CAPTIONS_CSV = "captions.txt"
+IMG_DIR      = "./fickr8k/Images"
+CAPTIONS_CSV = "./fickr8k/captions.txt"
 LATENT_CACHE = "latents_cache.pt"    # pre-computed VAE latents (created once)
 
 # swap "openai/clip-vit-large-patch14" for richer 768-dim embeddings
@@ -522,10 +525,90 @@ class LiveViz:
         self.fig.canvas.flush_events()
         plt.pause(0.001)
 
+    def close(self):
+        plt.ioff(); plt.show()
+
+
+# ── CLI progress (--no_gui mode) ───────────────────────────────────────────────
+
+class CLIProgress:
+    """Rich terminal dashboard used when --no_gui is passed."""
+
+    def __init__(self):
+        from rich.console import Console
+        from rich.live import Live
+        self.console = Console()
+        self._s = dict(epoch=0, total=EPOCHS, step=0,
+                       loss=0.0, ema=0.0, lr=LR, best=float("inf"))
+        self.ema_vals   = []
+        self._ema_alpha = 0.02
+        self._live = Live(self._render(), refresh_per_second=4,
+                          console=self.console, transient=False)
+        self._live.__enter__()
+
+    def _render(self):
+        from rich.table import Table
+        from rich.panel import Panel
+        s = self._s
+        t = Table(show_header=True, header_style="bold cyan",
+                  expand=True, border_style="bright_black")
+        for col, just in [("Epoch","center"),("Step","right"),
+                          ("Loss","right"),("EMA Loss","right"),
+                          ("LR","right"),("Best Loss","right")]:
+            t.add_column(col, justify=just)
+        new_best = s["loss"] <= s["best"] + 1e-9
+        t.add_row(
+            f"[cyan]{s['epoch']}/{s['total']}[/]",
+            f"[white]{s['step']:,}[/]",
+            f"[yellow]{s['loss']:.5f}[/]",
+            f"[bright_green]{s['ema']:.5f}[/]",
+            f"[blue]{s['lr']:.2e}[/]",
+            f"[bright_green]{s['best']:.5f}[/]" if new_best
+            else f"[white]{s['best']:.5f}[/]",
+        )
+        return Panel(
+            t,
+            title=(f"[bold magenta]Flux2-Flickr[/]  "
+                   f"[dim]{BACKBONE.upper()} · CLIP · VAE · Rectified Flow[/]"),
+            subtitle=f"[dim]{DEVICE.upper()} · CFG ×{CFG_SCALE}[/]",
+            border_style="bright_black",
+        )
+
+    def update_loss(self, step, loss):
+        self._s["step"] = step
+        self._s["loss"] = loss
+        ema = ((1 - self._ema_alpha) * self.ema_vals[-1] + self._ema_alpha * loss
+               if self.ema_vals else loss)
+        self.ema_vals.append(ema)
+        self._s["ema"] = ema
+        if loss < self._s["best"]:
+            self._s["best"] = loss
+
+    def update_samples(self, images, captions):
+        # Briefly stop the live panel, print a log line, resume
+        self._live.stop()
+        self.console.log(
+            f"[cyan]step {self._s['step']}[/] → samples: "
+            + "  ".join(f'[dim italic]"{c[:40]}"[/]' for c in captions)
+        )
+        self._live.start()
+
+    def set_info(self, epoch, total_epochs, lr):
+        self._s["epoch"] = epoch
+        self._s["total"] = total_epochs
+        self._s["lr"]    = lr
+
+    def flush(self):
+        self._live.update(self._render())
+
+    def close(self):
+        self._live.__exit__(None, None, None)
+        self.console.print("[bold green]✓ Training complete.[/]")
+
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
-def train():
+def train(no_gui=False):
     print(f"Device: {DEVICE}  |  Backbone: {BACKBONE}")
 
     # ── frozen pretrained models ──────────────────────────────────────────────
@@ -571,7 +654,7 @@ def train():
             print(f"Could not resume: {e} — starting fresh")
 
     # ── viz ───────────────────────────────────────────────────────────────────
-    viz = LiveViz()
+    viz = CLIProgress() if no_gui else LiveViz()
     fixed_prompts = [
         "a dog running on the beach",
         "a child playing in a park",
@@ -646,8 +729,7 @@ def train():
                         "loss": avg}, p)
             print(f"  → {p}")
 
-    print("Training complete.")
-    plt.ioff(); plt.show()
+    viz.close()
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -674,9 +756,23 @@ def generate(prompt, checkpoint, n=4, cfg=CFG_SCALE):
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) >= 3 and sys.argv[1] == "generate":
-        generate(sys.argv[2], sys.argv[3],
-                 n=int(sys.argv[4]) if len(sys.argv) > 4 else 4)
+    import argparse
+    p = argparse.ArgumentParser(description="Flux2-style latent diffusion on Flickr8k")
+    p.add_argument("--no_gui",     action="store_true",
+                   help="CLI-only mode: rich terminal dashboard instead of matplotlib window")
+    p.add_argument("--generate",   metavar="PROMPT", default=None,
+                   help="Generate images from a text prompt")
+    p.add_argument("--checkpoint", metavar="PATH",   default=None,
+                   help="Checkpoint to load for generation")
+    p.add_argument("--n",          type=int, default=4,
+                   help="Number of images to generate (default 4)")
+    p.add_argument("--cfg",        type=float, default=CFG_SCALE,
+                   help=f"CFG guidance scale (default {CFG_SCALE})")
+    args = p.parse_args()
+
+    if args.generate:
+        if not args.checkpoint:
+            p.error("--generate requires --checkpoint")
+        generate(args.generate, args.checkpoint, n=args.n, cfg=args.cfg)
     else:
-        train()
+        train(no_gui=args.no_gui)
