@@ -118,10 +118,11 @@ class FrozenCLIP(nn.Module):
     @torch.no_grad()
     def encode_text_pooled(self, texts, device):
         """Returns L2-normalised pooled text embedding (B, 512) for CLIP loss."""
-        tok = self.tok(texts, padding="max_length", max_length=CLIP_SEQ_LEN,
-                       truncation=True, return_tensors="pt")
-        feats = self.model.get_text_features(input_ids=tok.input_ids.to(device),
-                                             attention_mask=tok.attention_mask.to(device))
+        tok  = self.tok(texts, padding="max_length", max_length=CLIP_SEQ_LEN,
+                        truncation=True, return_tensors="pt")
+        out  = self.model.text_model(input_ids=tok.input_ids.to(device),
+                                     attention_mask=tok.attention_mask.to(device))
+        feats = self.model.text_projection(out.pooler_output)
         return F.normalize(feats, dim=-1)
 
     def encode_images_for_loss(self, imgs):
@@ -135,7 +136,8 @@ class FrozenCLIP(nn.Module):
                              device=imgs.device).view(1, 3, 1, 1)
         std  = torch.tensor([0.26862954, 0.26130258, 0.27577711],
                              device=imgs.device).view(1, 3, 1, 1)
-        feats = self.model.get_image_features(pixel_values=(x - mean) / std)
+        out   = self.model.vision_model(pixel_values=(x - mean) / std)
+        feats = self.model.visual_projection(out.pooler_output)
         return F.normalize(feats, dim=-1)
 
     def null_embed(self, B, device):
