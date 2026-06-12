@@ -74,10 +74,17 @@ LR           = 1e-4
 EPOCHS       = 200
 FLOW_STEPS   = 50                    # Euler ODE steps at inference
 CFG_DROPOUT  = 0.15
-CFG_SCALE    = 3.0                   # bump to 7.5 after ~50 epochs
-EMA_DECAY    = 0.9999
+CFG_SCALE    = 7.5                   # higher CFG → sharper, more text-aligned outputs
+EMA_DECAY    = 0.9995                # was 0.9999 — faster adaptation
 VIZ_EVERY    = 50
 SAVE_EVERY   = 10
+
+# LR warm-restart schedule: resets every SCHED_T0 epochs, then doubles each cycle.
+# Prevents the LR dying to zero and freezing learning (the plateau cause).
+SCHED_T0     = 30                    # first restart period in epochs
+SCHED_TMULT  = 2                     # each cycle is 2× longer: 30 → 60 → 120 epochs
+SCHED_LR_MIN = 1e-6                  # floor LR between restarts
+LAT_NOISE    = 0.02                  # std of noise added to cached latents (augmentation)
 
 CLIP_LOSS_WEIGHT = 0.05   # auxiliary CLIP semantic loss weight
 CLIP_LOSS_EVERY  = 20    # compute every N steps (VAE decode + CLIP forward is expensive)
@@ -658,8 +665,13 @@ def train(no_gui=False):
 
     flow      = RectifiedFlow()
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-    lr_sched  = torch.optim.lr_scheduler.CosineAnnealingLR(
-                    optimizer, T_max=EPOCHS * len(loader))
+    # Warm restarts: LR resets to LR every SCHED_T0 epochs, then cycle doubles.
+    # This prevents the "dying LR" plateau that kills learning after ~150 epochs.
+    lr_sched  = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                    optimizer,
+                    T_0=SCHED_T0 * len(loader),
+                    T_mult=SCHED_TMULT,
+                    eta_min=SCHED_LR_MIN)
 
     # ── resume ────────────────────────────────────────────────────────────────
     start_epoch, step, best_loss = 1, 0, float("inf")
@@ -673,7 +685,11 @@ def train(no_gui=False):
             start_epoch = ck["epoch"] + 1
             step        = ck.get("step", 0)
             best_loss   = ck.get("loss", float("inf"))
-            for _ in range(step): lr_sched.step()
+            if "lr_sched" in ck:
+                lr_sched.load_state_dict(ck["lr_sched"])
+            else:
+                # old checkpoint: fast-forward scheduler without storing history
+                lr_sched.step(step)
             print(f"Resumed {ckpts[-1]} (epoch {ck['epoch']}, step {step})")
         except Exception as e:
             print(f"Could not resume: {e} — starting fresh")
@@ -700,6 +716,10 @@ def train(no_gui=False):
                 lats = vae.encode(lats.to(DEVICE))
             else:
                 lats = lats.to(DEVICE, dtype=torch.float32)
+
+            # latent noise augmentation — prevents overfitting on small datasets
+            if LAT_NOISE > 0:
+                lats = lats + torch.randn_like(lats) * LAT_NOISE
 
             # CLIP text encoding with CFG dropout
             drop  = torch.rand(len(captions)) < CFG_DROPOUT
@@ -788,6 +808,7 @@ def train(no_gui=False):
                         "model": model.state_dict(),
                         "ema_model": ema_model.state_dict(),
                         "optimizer": optimizer.state_dict(),
+                        "lr_sched":  lr_sched.state_dict(),
                         "loss": avg}, p)
             ckpt_msg = f"  → saved {p}"
             if no_gui:
