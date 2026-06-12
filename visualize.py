@@ -169,9 +169,10 @@ def build_dashboard(entries, save_path=None):
                       transform=ax_stats.transAxes)
         ax_stats.text(0.97, y, val, color=col, fontsize=7.5,
                       ha="right", transform=ax_stats.transAxes)
-        # divider
-        ax_stats.axhline(y - 0.01, xmin=0.04, xmax=0.96,
-                         color="#2d333b", lw=0.4, transform=ax_stats.transAxes)
+        # divider line drawn in axes-fraction coordinates
+        ax_stats.plot([0.04, 0.96], [y - 0.015, y - 0.015],
+                      color="#2d333b", lw=0.5,
+                      transform=ax_stats.transAxes, clip_on=False)
         y -= 0.103
 
     # ── 3. Recent loss zoom (last 2000 steps) ─────────────────────────────────
@@ -259,6 +260,19 @@ def build_dashboard(entries, save_path=None):
     ax4 = fig.add_subplot(gs[2, 2])
     style_ax(ax4)
     ax4.plot(steps, lrs, color="#4fc3f7", lw=1.2)
+    ax4.fill_between(steps, 0, lrs, alpha=0.12, color="#4fc3f7")
+    # anchor Y at 0 so the scale is honest (autoscale hides near-zero LR)
+    ax4.set_ylim(bottom=0, top=max(lrs) * 1.15)
+    # mark warm-restart peaks (local maxima) if any
+    if len(lrs) > 10:
+        prev_up = False
+        for i in range(1, len(lrs) - 1):
+            going_up   = lrs[i] > lrs[i - 1]
+            going_down = lrs[i] > lrs[i + 1]
+            if going_up and going_down and not prev_up:
+                ax4.axvline(steps[i], color="#ff6b35", lw=0.7,
+                            linestyle="--", alpha=0.6)
+            prev_up = going_up
     ax4.set_title("Learning Rate Schedule")
     ax4.set_xlabel("Step"); ax4.set_ylabel("LR")
     ax4.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
