@@ -55,6 +55,21 @@ def style_ax(ax):
         sp.set_color("#2d333b")
 
 
+def plateau_status(ep_avgs, patience_epochs=5):
+    """Return (status_str, color) indicating if training is converging or stuck."""
+    if len(ep_avgs) < 2:
+        return "warming up", "#888888"
+    recent = ep_avgs[-min(patience_epochs, len(ep_avgs)):]
+    improvement = recent[0] - recent[-1]
+    pct = improvement / (recent[0] + 1e-8) * 100
+    if pct > 2.0:
+        return f"converging  ({pct:.1f}% over {len(recent)} ep)", "#00e676"
+    elif pct > 0.5:
+        return f"slow descent ({pct:.1f}% over {len(recent)} ep)", "#ffd740"
+    else:
+        return f"PLATEAU — only {pct:.1f}% in {len(recent)} ep", "#ff5252"
+
+
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 
 def build_dashboard(entries, save_path=None):
@@ -62,15 +77,15 @@ def build_dashboard(entries, save_path=None):
         print("No log entries found — nothing to plot yet.")
         return
 
-    steps       = [e["step"]       for e in entries]
-    flow_losses = [e["flow_loss"]   for e in entries]
-    total_losses= [e["total_loss"]  for e in entries]
-    lrs         = [e["lr"]          for e in entries]
-    epochs_list = [e["epoch"]       for e in entries]
-    timestamps  = [e.get("ts", 0)   for e in entries]
+    steps        = [e["step"]      for e in entries]
+    flow_losses  = [e["flow_loss"] for e in entries]
+    total_losses = [e["total_loss"] for e in entries]
+    lrs          = [e["lr"]        for e in entries]
+    epochs_list  = [e["epoch"]     for e in entries]
+    timestamps   = [e.get("ts", 0) for e in entries]
 
-    clip_steps  = [e["step"]       for e in entries if e.get("clip_loss") is not None]
-    clip_vals   = [e["clip_loss"]  for e in entries if e.get("clip_loss") is not None]
+    clip_steps = [e["step"]      for e in entries if e.get("clip_loss") is not None]
+    clip_vals  = [e["clip_loss"] for e in entries if e.get("clip_loss") is not None]
 
     epoch_buckets = defaultdict(list)
     for e in entries:
@@ -79,96 +94,113 @@ def build_dashboard(entries, save_path=None):
     ep_avgs = [float(np.mean(epoch_buckets[ep])) for ep in ep_nums]
     ep_mins = [float(np.min(epoch_buckets[ep]))  for ep in ep_nums]
 
-    flow_ema    = ema(flow_losses, alpha=0.02)
-    clip_ema    = ema(clip_vals,   alpha=0.05) if clip_vals else []
+    flow_ema_vals = ema(flow_losses, alpha=0.02)
+    clip_ema_vals = ema(clip_vals,   alpha=0.05) if clip_vals else []
 
-    # ── timing estimate ───────────────────────────────────────────────────────
+    # ── timing / ETA ─────────────────────────────────────────────────────────
     steps_per_sec = None
     eta_str = "n/a"
-    if len(timestamps) >= 2 and timestamps[-1] and timestamps[0]:
-        elapsed = timestamps[-1] - timestamps[0]
-        n_steps = steps[-1] - steps[0]
-        if elapsed > 0 and n_steps > 0:
-            steps_per_sec = n_steps / elapsed
+    elapsed_str = "n/a"
+    from_train = [t for t in timestamps if t]
+    if len(from_train) >= 2:
+        elapsed   = from_train[-1] - from_train[0]
+        n_logged  = steps[-1] - steps[0]
+        if elapsed > 0 and n_logged > 0:
+            steps_per_sec = n_logged / elapsed
+            elapsed_str = _fmt_duration(elapsed)
 
     # ── figure ────────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(18, 11), facecolor="#0d1117")
+    fig = plt.figure(figsize=(18, 12), facecolor="#0d1117")
     fig.suptitle("Training Health Dashboard", color="white", fontsize=13,
-                 fontweight="bold", y=0.98)
+                 fontweight="bold", y=0.985)
 
-    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.52, wspace=0.38,
-                           left=0.06, right=0.97, top=0.93, bottom=0.10)
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.38,
+                           left=0.06, right=0.97, top=0.94, bottom=0.07)
 
-    # ── 1. Flow loss (raw + EMA) ──────────────────────────────────────────────
+    # ── 1. Full loss curve ────────────────────────────────────────────────────
     ax1 = fig.add_subplot(gs[0, :2])
     style_ax(ax1)
-    ax1.plot(steps, flow_losses, color="#00d4ff", lw=0.5, alpha=0.25, label="raw")
-    ax1.plot(steps, flow_ema,    color="#ff6b35", lw=1.8,              label="EMA")
-    if any(tl != fl for tl, fl in zip(total_losses, flow_losses)):
-        ax1.plot(steps, total_losses, color="#a0f0a0", lw=0.8, alpha=0.5,
-                 label="total (flow + CLIP)")
-    best_idx   = int(np.argmin(flow_ema))
-    ax1.axvline(steps[best_idx], color="#ffd700", lw=0.8, linestyle="--", alpha=0.6)
-    ax1.annotate(f"best EMA\n{flow_ema[best_idx]:.5f}",
-                 xy=(steps[best_idx], flow_ema[best_idx]),
-                 xytext=(10, 10), textcoords="offset points",
-                 color="#ffd700", fontsize=6, arrowprops=dict(arrowstyle="->", color="#ffd700"))
-    ax1.set_title("Flow Loss (MSE on velocity field)")
+    ax1.plot(steps, flow_losses, color="#00d4ff", lw=0.5, alpha=0.2, label="raw")
+    ax1.plot(steps, flow_ema_vals, color="#ff6b35", lw=1.8,            label="EMA")
+    if any(abs(tl - fl) > 1e-6 for tl, fl in zip(total_losses, flow_losses)):
+        ax1.plot(steps, total_losses, color="#a0f0a0", lw=0.8, alpha=0.45,
+                 label="total (flow+CLIP)")
+    best_idx = int(np.argmin(flow_ema_vals))
+    ax1.axvline(steps[best_idx], color="#ffd700", lw=0.8, linestyle="--", alpha=0.7)
+    ax1.annotate(f"best EMA\n{flow_ema_vals[best_idx]:.5f}",
+                 xy=(steps[best_idx], flow_ema_vals[best_idx]),
+                 xytext=(10, 12), textcoords="offset points",
+                 color="#ffd700", fontsize=6,
+                 arrowprops=dict(arrowstyle="->", color="#ffd700", lw=0.8))
+    ax1.set_title("Flow Loss — full training history")
     ax1.set_xlabel("Step"); ax1.set_ylabel("Loss")
     ax1.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7, loc="upper right")
 
-    # ── 2. Stats summary panel ────────────────────────────────────────────────
+    # ── 2. Stats + health panel ───────────────────────────────────────────────
     ax_stats = fig.add_subplot(gs[0, 2])
     style_ax(ax_stats)
     ax_stats.set_axis_off()
-    current_epoch = epochs_list[-1]
-    current_ema   = flow_ema[-1]
-    best_ema_val  = min(flow_ema)
-    best_epoch    = ep_nums[int(np.argmin(ep_avgs))] if ep_avgs else "?"
-    sps_str       = f"{steps_per_sec:.1f} steps/s" if steps_per_sec else "n/a"
 
-    lines = [
-        ("Current epoch",   f"{current_epoch}"),
-        ("Total steps",     f"{steps[-1]:,}"),
-        ("Current EMA",     f"{current_ema:.5f}"),
-        ("Best EMA",        f"{best_ema_val:.5f}"),
-        ("Best epoch",      f"{best_epoch}"),
-        ("Speed",           sps_str),
-        ("CLIP loss pts",   f"{len(clip_vals)}"),
-    ]
-    y = 0.92
-    ax_stats.text(0.5, 1.02, "Quick Stats", ha="center", va="top",
+    current_epoch = epochs_list[-1]
+    current_ema   = flow_ema_vals[-1]
+    best_ema_val  = min(flow_ema_vals)
+    best_epoch    = ep_nums[int(np.argmin(ep_avgs))] if ep_avgs else "?"
+    sps_str       = f"{steps_per_sec:.1f} /s" if steps_per_sec else "n/a"
+    plateau_msg, plateau_col = plateau_status(ep_avgs)
+
+    ax_stats.text(0.5, 1.03, "Quick Stats", ha="center", va="top",
                   color="white", fontsize=9, fontweight="bold",
                   transform=ax_stats.transAxes)
-    for label, val in lines:
-        ax_stats.text(0.05, y, label, color="#888", fontsize=8,
-                      transform=ax_stats.transAxes)
-        ax_stats.text(0.97, y, val, color="#00d4ff", fontsize=8,
-                      ha="right", transform=ax_stats.transAxes)
-        y -= 0.13
 
-    # ── 3. CLIP loss ──────────────────────────────────────────────────────────
-    ax2 = fig.add_subplot(gs[1, 0])
-    style_ax(ax2)
-    if clip_vals:
-        ax2.scatter(clip_steps, clip_vals, color="#c77dff", s=6, alpha=0.5, label="raw")
-        ax2.plot(clip_steps, clip_ema,     color="#ff9ef5", lw=1.5,         label="EMA")
-        ax2.axhline(0, color="#444", lw=0.5, linestyle="--")
-        ax2.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7)
-    else:
-        ax2.text(0.5, 0.5, "No CLIP loss yet\n(runs every 20 steps)",
-                 ha="center", va="center", color="#555", fontsize=8,
-                 transform=ax2.transAxes)
-    ax2.set_title("CLIP Semantic Loss (1 − cos_sim)")
-    ax2.set_xlabel("Step"); ax2.set_ylabel("CLIP loss")
+    rows = [
+        ("Status",        plateau_msg,               plateau_col),
+        ("Epoch",         str(current_epoch),         "#00d4ff"),
+        ("Total steps",   f"{steps[-1]:,}",           "#00d4ff"),
+        ("Current EMA",   f"{current_ema:.5f}",       "#00d4ff"),
+        ("Best EMA",      f"{best_ema_val:.5f}",      "#ffd700"),
+        ("Best epoch",    str(best_epoch),            "#ffd700"),
+        ("Speed",         sps_str,                    "#00d4ff"),
+        ("Elapsed",       elapsed_str,                "#aaaaaa"),
+        ("CLIP pts",      str(len(clip_vals)),        "#c77dff" if clip_vals else "#ff5252"),
+    ]
+    y = 0.91
+    for label, val, col in rows:
+        ax_stats.text(0.04, y, label, color="#666", fontsize=7.5,
+                      transform=ax_stats.transAxes)
+        ax_stats.text(0.97, y, val, color=col, fontsize=7.5,
+                      ha="right", transform=ax_stats.transAxes)
+        # divider
+        ax_stats.axhline(y - 0.01, xmin=0.04, xmax=0.96,
+                         color="#2d333b", lw=0.4, transform=ax_stats.transAxes)
+        y -= 0.103
+
+    # ── 3. Recent loss zoom (last 2000 steps) ─────────────────────────────────
+    ZOOM = 2000
+    ax_zoom = fig.add_subplot(gs[1, 0])
+    style_ax(ax_zoom)
+    z_steps = steps[-ZOOM:]
+    z_flow  = flow_losses[-ZOOM:]
+    z_ema   = flow_ema_vals[-ZOOM:]
+    ax_zoom.plot(z_steps, z_flow, color="#00d4ff", lw=0.6, alpha=0.3)
+    ax_zoom.plot(z_steps, z_ema,  color="#ff6b35", lw=1.6, label="EMA")
+    # trend line over the zoom window
+    if len(z_steps) >= 10:
+        coeffs = np.polyfit(range(len(z_ema)), z_ema, 1)
+        trend  = np.polyval(coeffs, range(len(z_ema)))
+        tcol   = "#00e676" if coeffs[0] < 0 else "#ff5252"
+        ax_zoom.plot(z_steps, trend, color=tcol, lw=1.2, linestyle="--",
+                     label=f"trend ({'↓' if coeffs[0] < 0 else '↑'})")
+    ax_zoom.set_title(f"Recent Loss — last {min(ZOOM, len(steps))} steps")
+    ax_zoom.set_xlabel("Step"); ax_zoom.set_ylabel("Loss")
+    ax_zoom.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7)
 
     # ── 4. Per-epoch avg loss ─────────────────────────────────────────────────
     ax3 = fig.add_subplot(gs[1, 1])
     style_ax(ax3)
     ax3.plot(ep_nums, ep_avgs, color="#ffd700", lw=1.8, marker="o",
-             markersize=3, label="avg loss")
+             markersize=4, label="avg loss")
     ax3.fill_between(ep_nums, ep_mins, ep_avgs, alpha=0.15, color="#ffd700",
-                     label="min–avg range")
+                     label="min–avg band")
     best_ep_idx = int(np.argmin(ep_avgs))
     ax3.axhline(ep_avgs[best_ep_idx], color="#ff4444", lw=0.8, linestyle="--",
                 label=f"best {ep_avgs[best_ep_idx]:.4f} @ ep {ep_nums[best_ep_idx]}")
@@ -176,32 +208,46 @@ def build_dashboard(entries, save_path=None):
     ax3.set_xlabel("Epoch"); ax3.set_ylabel("Avg Loss")
     ax3.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7)
 
-    # ── 5. Learning rate ──────────────────────────────────────────────────────
-    ax4 = fig.add_subplot(gs[1, 2])
-    style_ax(ax4)
-    ax4.plot(steps, lrs, color="#4fc3f7", lw=1.2)
-    ax4.set_title("Learning Rate Schedule")
-    ax4.set_xlabel("Step"); ax4.set_ylabel("LR")
-    ax4.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
+    # ── 5. CLIP semantic loss ─────────────────────────────────────────────────
+    ax2 = fig.add_subplot(gs[1, 2])
+    style_ax(ax2)
+    if clip_vals:
+        ax2.scatter(clip_steps, clip_vals, color="#c77dff", s=8, alpha=0.5, label="raw")
+        ax2.plot(clip_steps, clip_ema_vals, color="#ff9ef5", lw=1.8, label="EMA")
+        ax2.axhline(0, color="#444", lw=0.5, linestyle="--")
+        best_clip = min(clip_ema_vals)
+        ax2.axhline(best_clip, color="#ffd700", lw=0.7, linestyle=":",
+                    label=f"best {best_clip:.4f}")
+        ax2.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7)
+    else:
+        ax2.text(0.5, 0.5,
+                 "No CLIP loss logged yet.\n\nIf training is running, check\nCLIP_LOSS_WEIGHT > 0 and\nCLIP_LOSS_EVERY in config.",
+                 ha="center", va="center", color="#666", fontsize=8,
+                 transform=ax2.transAxes, linespacing=1.7)
+    ax2.set_title("CLIP Semantic Loss (1 − cos_sim)")
+    ax2.set_xlabel("Step"); ax2.set_ylabel("CLIP loss")
 
     # ── 6. Loss distribution histogram ───────────────────────────────────────
     ax5 = fig.add_subplot(gs[2, 0])
     style_ax(ax5)
     ax5.hist(flow_losses, bins=60, color="#00d4ff", alpha=0.7, edgecolor="none")
-    ax5.axvline(np.median(flow_losses), color="#ffd700", lw=1.2,
-                linestyle="--", label=f"median {np.median(flow_losses):.4f}")
+    med = float(np.median(flow_losses))
+    ax5.axvline(med, color="#ffd700", lw=1.3, linestyle="--",
+                label=f"median {med:.4f}")
+    ax5.axvline(float(np.percentile(flow_losses, 10)), color="#a0f0a0", lw=0.8,
+                linestyle=":", label=f"p10 {np.percentile(flow_losses, 10):.4f}")
     ax5.set_title("Loss Distribution (all steps)")
     ax5.set_xlabel("Flow Loss"); ax5.set_ylabel("Count")
     ax5.legend(facecolor="#1a1a2e", labelcolor="white", fontsize=7)
 
-    # ── 7. Loss volatility (rolling std) ─────────────────────────────────────
+    # ── 7. Loss volatility ────────────────────────────────────────────────────
     ax6 = fig.add_subplot(gs[2, 1])
     style_ax(ax6)
     window = max(20, len(flow_losses) // 40)
     if len(flow_losses) >= window:
-        roll_std = [float(np.std(flow_losses[max(0, i-window):i+1]))
+        roll_std = [float(np.std(flow_losses[max(0, i - window):i + 1]))
                     for i in range(len(flow_losses))]
-        ax6.plot(steps, roll_std, color="#ff9800", lw=1.0)
+        ax6.plot(steps, roll_std, color="#ff9800", lw=0.9)
         ax6.set_title(f"Loss Volatility (rolling std, w={window})")
         ax6.set_xlabel("Step"); ax6.set_ylabel("Std Dev")
     else:
@@ -209,32 +255,42 @@ def build_dashboard(entries, save_path=None):
                  color="#555", fontsize=8, transform=ax6.transAxes)
         ax6.set_title("Loss Volatility")
 
-    # ── 8. Steps per epoch bar ────────────────────────────────────────────────
-    ax7 = fig.add_subplot(gs[2, 2])
-    style_ax(ax7)
-    ep_counts = {ep: len(v) for ep, v in epoch_buckets.items()}
-    if ep_counts:
-        ax7.bar(list(ep_counts.keys()), list(ep_counts.values()),
-                color="#7eb8f7", alpha=0.8, width=0.7)
-        ax7.set_title("Logged Steps per Epoch")
-        ax7.set_xlabel("Epoch"); ax7.set_ylabel("Log entries")
-    else:
-        ax7.set_title("Logged Steps per Epoch")
+    # ── 8. LR schedule ────────────────────────────────────────────────────────
+    ax4 = fig.add_subplot(gs[2, 2])
+    style_ax(ax4)
+    ax4.plot(steps, lrs, color="#4fc3f7", lw=1.2)
+    ax4.set_title("Learning Rate Schedule")
+    ax4.set_xlabel("Step"); ax4.set_ylabel("LR")
+    ax4.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
 
-    # ── timestamp footer ──────────────────────────────────────────────────────
+    # ── footer ────────────────────────────────────────────────────────────────
     last_ts = timestamps[-1]
     ts_str  = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_ts)) if last_ts else "?"
-    fig.text(0.5, 0.01, f"Last log entry: {ts_str}  |  {len(entries)} total records",
-             ha="center", color="#555", fontsize=8)
+    fig.text(0.5, 0.005,
+             f"Last entry: {ts_str}  |  {len(entries):,} log records  |  "
+             f"{len(ep_nums)} epochs  |  {len(clip_vals)} CLIP pts",
+             ha="center", color="#444", fontsize=8)
 
     if save_path:
         plt.savefig(save_path, dpi=120, bbox_inches="tight",
                     facecolor=fig.get_facecolor())
-        print(f"[{time.strftime('%H:%M:%S')}] Saved → {save_path}  ({len(entries)} records)")
+        print(f"[{time.strftime('%H:%M:%S')}] Saved → {save_path}  "
+              f"({len(entries)} records, {len(clip_vals)} CLIP pts)")
     else:
         plt.tight_layout()
         plt.show()
     plt.close(fig)
+
+
+def _fmt_duration(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -242,11 +298,11 @@ def build_dashboard(entries, save_path=None):
 def main():
     parser = argparse.ArgumentParser(description="Training health dashboard")
     parser.add_argument("--file",     default="training_log.jsonl",
-                        help="Path to the JSONL log file (default: training_log.jsonl)")
+                        help="JSONL log file (default: training_log.jsonl)")
     parser.add_argument("--save",     default=None, metavar="PNG",
-                        help="Save dashboard to this PNG path instead of showing")
+                        help="Save to PNG instead of showing interactively")
     parser.add_argument("--watch",    action="store_true",
-                        help="Auto-refresh mode: re-render on each interval")
+                        help="Auto-refresh mode (saves PNG on each tick)")
     parser.add_argument("--interval", type=int, default=30,
                         help="Refresh interval in seconds for --watch (default: 30)")
     args = parser.parse_args()

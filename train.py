@@ -688,6 +688,8 @@ def train(no_gui=False):
     ]
 
     # ── train loop ────────────────────────────────────────────────────────────
+    _log_clip_loss = None  # persists until consumed by a log entry (fixes step-offset bug)
+
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         epoch_loss = 0.0
@@ -711,7 +713,6 @@ def train(no_gui=False):
             v_pred        = model(x_t, t, ctx)
             loss          = F.mse_loss(v_pred, v_tgt)
             flow_loss_val = loss.item()
-            clip_loss_val = None
 
             # CLIP auxiliary loss — "does the predicted image match the text?"
             # Gradients flow: CLIP image encoder → VAE decoder → x0_pred → v_pred → UNet
@@ -725,8 +726,8 @@ def train(no_gui=False):
                 with torch.no_grad():
                     # use original captions (not CFG-dropped texts)
                     txt_feats = clip.encode_text_pooled(list(captions[:n]), DEVICE)
-                clip_loss     = 1.0 - (img_feats * txt_feats).sum(dim=-1).mean()
-                clip_loss_val = clip_loss.item()
+                clip_loss       = 1.0 - (img_feats * txt_feats).sum(dim=-1).mean()
+                _log_clip_loss  = clip_loss.item()   # persist until next log entry
                 loss = loss + CLIP_LOSS_WEIGHT * clip_loss
 
             optimizer.zero_grad()
@@ -750,11 +751,12 @@ def train(no_gui=False):
                         "step":       step,
                         "epoch":      epoch,
                         "flow_loss":  flow_loss_val,
-                        "clip_loss":  clip_loss_val,
+                        "clip_loss":  _log_clip_loss,
                         "total_loss": loss.item(),
                         "lr":         lr_sched.get_last_lr()[0],
                         "ts":         time.time(),
                     }) + "\n")
+                _log_clip_loss = None  # consumed — wait for next CLIP compute
 
             # sample generation only in GUI mode (expensive, nothing to show otherwise)
             if step % VIZ_EVERY == 0 and not no_gui:
