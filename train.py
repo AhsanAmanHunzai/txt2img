@@ -14,7 +14,7 @@ For SDXL/FLUX LoRA fine-tuning instead of training from scratch:
   → requires only ~500 images and converges in < 1 hour on 1 GPU
 """
 
-import os, math, copy, glob, random, warnings
+import os, math, copy, glob, random, warnings, json, time
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
-from transformers import CLIPTokenizer, CLIPTextModel
+from transformers import CLIPTokenizer, CLIPModel
 from diffusers import AutoencoderKL
 
 import sys as _sys
@@ -79,6 +79,13 @@ EMA_DECAY    = 0.9999
 VIZ_EVERY    = 50
 SAVE_EVERY   = 10
 
+CLIP_LOSS_WEIGHT = 0.05   # auxiliary CLIP semantic loss weight
+CLIP_LOSS_EVERY  = 20    # compute every N steps (VAE decode + CLIP forward is expensive)
+CLIP_LOSS_BATCH  = 4     # samples used for CLIP loss per compute
+
+LOG_FILE         = "training_log.jsonl"   # one JSON object per line
+LOG_EVERY        = 10                     # log every N steps
+
 EMBED_DIM    = 512                   # time embedding dim
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 SEED         = 42
@@ -90,22 +97,46 @@ np.random.seed(SEED)
 # ── Frozen CLIP text encoder ───────────────────────────────────────────────────
 
 class FrozenCLIP(nn.Module):
-    """CLIP ViT-B/32 text encoder, weights frozen."""
+    """CLIP ViT-B/32 — text encoder for cross-attention + image encoder for auxiliary loss."""
     def __init__(self, model_id=CLIP_MODEL):
         super().__init__()
-        self.tok = CLIPTokenizer.from_pretrained(model_id)
-        self.enc = CLIPTextModel.from_pretrained(model_id)
-        for p in self.enc.parameters():
+        self.tok   = CLIPTokenizer.from_pretrained(model_id)
+        self.model = CLIPModel.from_pretrained(model_id)
+        for p in self.model.parameters():
             p.requires_grad_(False)
-        self.enc.eval()
+        self.model.eval()
 
     @torch.no_grad()
     def encode(self, texts, device):
+        """Returns last-hidden-state sequence (B, 77, 512) for cross-attention."""
         tok = self.tok(texts, padding="max_length", max_length=CLIP_SEQ_LEN,
                        truncation=True, return_tensors="pt")
-        out = self.enc(input_ids=tok.input_ids.to(device),
-                       attention_mask=tok.attention_mask.to(device))
+        out = self.model.text_model(input_ids=tok.input_ids.to(device),
+                                    attention_mask=tok.attention_mask.to(device))
         return out.last_hidden_state  # (B, 77, 512)
+
+    @torch.no_grad()
+    def encode_text_pooled(self, texts, device):
+        """Returns L2-normalised pooled text embedding (B, 512) for CLIP loss."""
+        tok = self.tok(texts, padding="max_length", max_length=CLIP_SEQ_LEN,
+                       truncation=True, return_tensors="pt")
+        feats = self.model.get_text_features(input_ids=tok.input_ids.to(device),
+                                             attention_mask=tok.attention_mask.to(device))
+        return F.normalize(feats, dim=-1)
+
+    def encode_images_for_loss(self, imgs):
+        """
+        Returns L2-normalised pooled image embedding (B, 512).
+        imgs: (B,3,H,W) in [-1,1].  Gradients flow through so the UNet learns.
+        """
+        x = F.interpolate(imgs, size=(224, 224), mode="bilinear", align_corners=False)
+        x = x * 0.5 + 0.5  # [-1,1] → [0,1]
+        mean = torch.tensor([0.48145466, 0.4578275,  0.40821073],
+                             device=imgs.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.26862954, 0.26130258, 0.27577711],
+                             device=imgs.device).view(1, 3, 1, 1)
+        feats = self.model.get_image_features(pixel_values=(x - mean) / std)
+        return F.normalize(feats, dim=-1)
 
     def null_embed(self, B, device):
         return self.encode([""] * B, device)
@@ -132,6 +163,10 @@ class FrozenVAE(nn.Module):
     @torch.no_grad()
     def decode(self, z):
         """z: (B,4,h,w)  →  images (B,3,H,W) ∈ [-1,1]"""
+        return self.vae.decode(z / VAE_SCALE).sample
+
+    def decode_grad(self, z):
+        """Same as decode() but keeps the compute graph so gradients flow back through z."""
         return self.vae.decode(z / VAE_SCALE).sample
 
 
@@ -673,6 +708,24 @@ def train(no_gui=False):
             x_t, v_tgt   = flow.forward_process(lats, t)
             v_pred        = model(x_t, t, ctx)
             loss          = F.mse_loss(v_pred, v_tgt)
+            flow_loss_val = loss.item()
+            clip_loss_val = None
+
+            # CLIP auxiliary loss — "does the predicted image match the text?"
+            # Gradients flow: CLIP image encoder → VAE decoder → x0_pred → v_pred → UNet
+            if step % CLIP_LOSS_EVERY == 0 and CLIP_LOSS_WEIGHT > 0:
+                n    = min(CLIP_LOSS_BATCH, lats.shape[0])
+                tv   = t[:n].view(-1, 1, 1, 1)
+                # rectified flow x0 prediction: x0 = x_t - t * v
+                x0_pred  = (x_t[:n] - tv * v_pred[:n]).clamp(-4, 4)
+                imgs_pred = vae.decode_grad(x0_pred)          # (n,3,H,W) in [-1,1]
+                img_feats = clip.encode_images_for_loss(imgs_pred)  # gradients flow here
+                with torch.no_grad():
+                    # use original captions (not CFG-dropped texts)
+                    txt_feats = clip.encode_text_pooled(list(captions[:n]), DEVICE)
+                clip_loss     = 1.0 - (img_feats * txt_feats).sum(dim=-1).mean()
+                clip_loss_val = clip_loss.item()
+                loss = loss + CLIP_LOSS_WEIGHT * clip_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -688,6 +741,18 @@ def train(no_gui=False):
             step += 1
             viz.update_loss(step, loss.item())
             viz.set_info(epoch, EPOCHS, lr_sched.get_last_lr()[0])
+
+            if step % LOG_EVERY == 0:
+                with open(LOG_FILE, "a") as _lf:
+                    _lf.write(json.dumps({
+                        "step":       step,
+                        "epoch":      epoch,
+                        "flow_loss":  flow_loss_val,
+                        "clip_loss":  clip_loss_val,
+                        "total_loss": loss.item(),
+                        "lr":         lr_sched.get_last_lr()[0],
+                        "ts":         time.time(),
+                    }) + "\n")
 
             # sample generation only in GUI mode (expensive, nothing to show otherwise)
             if step % VIZ_EVERY == 0 and not no_gui:
